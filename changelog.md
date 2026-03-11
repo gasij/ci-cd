@@ -1,6 +1,18 @@
 ## v0.1.3 (2026-03-11)
 
 ### Изменения:
+- Update 03-versioning.yml%0A- Merge pull request #3 from gasij/main
+
+### Детали PR:
+- **Номер:** #4
+- **Название:** Feature
+- **Автор:** @gasij
+
+---
+
+## v0.1.3 (2026-03-11)
+
+### Изменения:
 - Update 01-test.yml
 
 ### Детали PR:
