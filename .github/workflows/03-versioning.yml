@@ -37,129 +37,66 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Debug - Print environment
-        if: github.event.inputs.debug_mode == 'true'
-        run: |
-          echo "🔍 DEBUG MODE - Environment info:"
-          echo "Event name: ${{ github.event_name }}"
-          echo "PR merged: ${{ github.event.pull_request.merged }}"
-          echo "PR number: ${{ github.event.pull_request.number }}"
-          echo "Base SHA: ${{ github.event.pull_request.base.sha }}"
-          echo "Head SHA: ${{ github.event.pull_request.head.sha }}"
-          echo "Current directory: $(pwd)"
-          echo "Files in repo:"
-          ls -la
-
       - name: Get current version
         id: get_current
         run: |
-          echo "📖 Reading current version..."
           if [ -f VERSION ]; then
             CURRENT_VERSION=$(cat VERSION)
-            echo "✅ Found VERSION file with content: $CURRENT_VERSION"
           else
             CURRENT_VERSION="0.1.0"
-            echo "⚠️ VERSION file not found, using default: $CURRENT_VERSION"
           fi
           echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
 
       - name: Determine version bump type
         id: get_type
         run: |
-          echo "🔍 Analyzing commits..."
+          COMMITS=$(git log ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }} --pretty=format:"%s" 2>/dev/null || echo "")
           
-          # Проверяем, что SHA существуют
-          if [ -z "${{ github.event.pull_request.base.sha }}" ] || [ -z "${{ github.event.pull_request.head.sha }}" ]; then
-            echo "❌ Error: Missing SHA information"
-            echo "base.sha: ${{ github.event.pull_request.base.sha }}"
-            echo "head.sha: ${{ github.event.pull_request.head.sha }}"
-            exit 1
-          fi
-          
-          # Получаем коммиты с обработкой ошибок
-          COMMITS=$(git log ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }} --pretty=format:"%s" 2>&1) || {
-            echo "⚠️ Git log command failed, using fallback"
-            COMMITS=""
-          }
-          
-          echo "📝 Commits in PR:"
-          echo "$COMMITS" | head -20
-          
-          # Определяем тип обновления
           if echo "$COMMITS" | grep -qiE "^(feat|feature):"; then
             echo "type=minor" >> $GITHUB_OUTPUT
             echo "version_type=minor" >> $GITHUB_OUTPUT
-            echo "✅ Detected minor version bump (feature)"
           elif echo "$COMMITS" | grep -qiE "^(fix|hotfix):"; then
             echo "type=patch" >> $GITHUB_OUTPUT
             echo "version_type=patch" >> $GITHUB_OUTPUT
-            echo "✅ Detected patch version bump (fix)"
           else
             echo "type=patch" >> $GITHUB_OUTPUT
             echo "version_type=patch" >> $GITHUB_OUTPUT
-            echo "⚠️ No specific pattern detected, using patch as default"
           fi
 
       - name: Bump version
         id: bump
         run: |
-          echo "🔧 Calculating new version..."
-          
           CURRENT="${{ steps.get_current.outputs.current_version }}"
           TYPE="${{ steps.get_type.outputs.type }}"
           
-          echo "Current version: $CURRENT"
-          echo "Bump type: $TYPE"
-          
-          # Валидация текущей версии
           if [ -z "$CURRENT" ]; then
-            echo "❌ Error: Current version is empty"
             CURRENT="0.1.0"
           fi
           
-          # Разбираем версию
           IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
           
-          # Проверяем, что все части - числа
-          if ! [[ "$MAJOR" =~ ^[0-9]+$ ]] || ! [[ "$MINOR" =~ ^[0-9]+$ ]] || ! [[ "$PATCH" =~ ^[0-9]+$ ]]; then
-            echo "❌ Error: Version parts are not numbers: $MAJOR.$MINOR.$PATCH"
-            echo "Using default values"
-            MAJOR=0
-            MINOR=1
-            PATCH=0
-          fi
+          MAJOR=${MAJOR:-0}
+          MINOR=${MINOR:-1}
+          PATCH=${PATCH:-0}
           
-          echo "Parsed: major=$MAJOR, minor=$MINOR, patch=$PATCH"
-          
-          # Обновляем версию
           if [ "$TYPE" = "minor" ]; then
             MINOR=$((MINOR + 1))
             PATCH=0
-            VERSION_TYPE="minor"
-            echo "⬆️ Bumping minor version"
           else
             PATCH=$((PATCH + 1))
-            VERSION_TYPE="patch"
-            echo "⬆️ Bumping patch version"
           fi
           
           NEW_VERSION="$MAJOR.$MINOR.$PATCH"
           echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
           echo "old_version=$CURRENT" >> $GITHUB_OUTPUT
-          echo "version_type=$VERSION_TYPE" >> $GITHUB_OUTPUT
-          
-          echo "✅ New version: $NEW_VERSION"
 
       - name: Update VERSION file
         run: |
-          echo "📝 Updating VERSION file"
           echo "${{ steps.bump.outputs.new_version }}" > VERSION
-          echo "New VERSION file content: $(cat VERSION)"
 
-      - name: Commit new version
+      # ИСПРАВЛЕНО: Безопасный пуш с pull --rebase
+      - name: Commit and push new version safely
         run: |
-          echo "💾 Committing changes..."
-          
           git config --global user.name 'GitHub Actions'
           git config --global user.email 'actions@github.com'
           
@@ -167,64 +104,91 @@ jobs:
           
           # Проверяем, есть ли изменения
           if git diff --staged --quiet; then
-            echo "ℹ️ No changes to commit"
-          else
-            echo "📦 Changes detected, committing..."
-            git status
-            git commit -m "[${{ steps.bump.outputs.new_version }}] <- [${{ steps.bump.outputs.old_version }}] ${{ steps.bump.outputs.version_type }} up"
-            
-            echo "🚀 Pushing to repository..."
-            git push
-            echo "✅ Push completed"
+            echo "No changes to commit"
+            exit 0
           fi
+          
+          # Создаем коммит
+          git commit -m "[${{ steps.bump.outputs.new_version }}] <- [${{ steps.bump.outputs.old_version }}] up"
+          
+          # Сохраняем текущий коммит во временную переменную
+          LOCAL_COMMIT=$(git rev-parse HEAD)
+          echo "Local commit: $LOCAL_COMMIT"
+          
+          # Пытаемся запушить с retry логикой
+          MAX_RETRIES=3
+          RETRY=0
+          
+          while [ $RETRY -lt $MAX_RETRIES ]; do
+            echo "Push attempt $((RETRY+1))/$MAX_RETRIES"
+            
+            # Пытаемся запушить
+            if git push; then
+              echo "✅ Push successful!"
+              exit 0
+            else
+              echo "⚠️ Push failed, checking for remote changes..."
+              RETRY=$((RETRY+1))
+              
+              if [ $RETRY -lt $MAX_RETRIES ]; then
+                echo "Pulling latest changes with rebase..."
+                git pull --rebase origin main
+                
+                # Проверяем, не потеряли ли мы наш коммит
+                if ! git cat-file -e $LOCAL_COMMIT 2>/dev/null; then
+                  echo "⚠️ Local commit was lost during rebase, recreating..."
+                  # Наш коммит был потерян при rebase, нужно создать его заново
+                  echo "${{ steps.bump.outputs.new_version }}" > VERSION
+                  git add VERSION
+                  git commit -m "[${{ steps.bump.outputs.new_version }}] <- [${{ steps.bump.outputs.old_version }}] up"
+                  LOCAL_COMMIT=$(git rev-parse HEAD)
+                fi
+              fi
+            fi
+          done
+          
+          echo "❌ Failed to push after $MAX_RETRIES attempts"
+          exit 1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  # Альтернативный вариант: использовать actions/github-script для пуша
   add-version-label:
     name: "Добавить label с версией"
     needs: bump-version
     runs-on: ubuntu-latest
     if: github.event.pull_request.merged == true && needs.bump-version.outputs.new_version != ''
     steps:
-      - name: Add version label using GitHub Script
+      - name: Add version label
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const newVersion = '${{ needs.bump-version.outputs.new_version }}';
             
-            console.log('='.repeat(50));
-            console.log('🏷️  ADDING VERSION LABEL');
-            console.log('='.repeat(50));
-            
             if (!newVersion) {
-              console.log('❌ No version provided, skipping label creation');
+              console.log('No version provided, skipping');
               return;
             }
             
             const labelName = `v${newVersion}`;
-            console.log(`Target label: ${labelName}`);
-            console.log(`PR #: ${context.issue.number}`);
             
             try {
               // Проверяем существование метки
               let labelExists = false;
               try {
-                console.log(`Checking if label ${labelName} exists...`);
                 await github.rest.issues.getLabel({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   name: labelName
                 });
                 labelExists = true;
-                console.log(`✅ Label ${labelName} already exists`);
               } catch (e) {
-                console.log(`ℹ️ Label ${labelName} does not exist, will create it`);
+                // Метка не существует
               }
               
               // Создаем метку, если её нет
               if (!labelExists) {
-                console.log(`Creating label ${labelName}...`);
                 await github.rest.issues.createLabel({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
@@ -232,11 +196,9 @@ jobs:
                   color: '0e8a16',
                   description: `Version ${newVersion}`
                 });
-                console.log(`✅ Created label ${labelName}`);
               }
               
               // Добавляем метку к PR
-              console.log(`Adding label to PR #${context.issue.number}...`);
               await github.rest.issues.addLabels({
                 issue_number: context.issue.number,
                 owner: context.repo.owner,
@@ -244,57 +206,7 @@ jobs:
                 labels: [labelName]
               });
               
-              console.log(`✅ Successfully added label ${labelName}`);
+              console.log(`✅ Added label ${labelName}`);
             } catch (error) {
-              console.log(`❌ Error: ${error.message}`);
-              console.log('⚠️ Continuing despite label error (non-critical)');
+              console.log(`⚠️ Label error: ${error.message}`);
             }
-            console.log('='.repeat(50));
-
-  debug-info:
-    name: "Диагностика ошибки"
-    runs-on: ubuntu-latest
-    if: failure()
-    needs: [bump-version]
-    steps:
-      - name: Collect debug information
-        run: |
-          echo "🔍 ERROR DIAGNOSTICS"
-          echo "=================="
-          
-          # Информация о событии
-          echo "📅 Event information:"
-          echo "  Event name: ${{ github.event_name }}"
-          echo "  PR merged: ${{ github.event.pull_request.merged }}"
-          echo "  PR number: ${{ github.event.pull_request.number }}"
-          echo "  Base SHA: ${{ github.event.pull_request.base.sha }}"
-          echo "  Head SHA: ${{ github.event.pull_request.head.sha }}"
-          echo ""
-          
-          # Информация о версиях
-          echo "📦 Version information:"
-          echo "  New version: ${{ needs.bump-version.outputs.new_version }}"
-          echo "  Old version: ${{ needs.bump-version.outputs.old_version }}"
-          echo "  Version type: ${{ needs.bump-version.outputs.version_type }}"
-          echo ""
-          
-          # Системная информация
-          echo "💻 System information:"
-          echo "  Node version: $(node --version)"
-          echo "  GitHub runner: ${{ runner.name }}"
-          echo "  OS: ${{ runner.os }}"
-          echo ""
-          
-          # Проверка переменных окружения
-          echo "🔐 Token check:"
-          if [ -n "${{ secrets.GITHUB_TOKEN }}" ]; then
-            echo "  GITHUB_TOKEN: ✅ Set"
-          else
-            echo "  GITHUB_TOKEN: ❌ Not set"
-          fi
-          echo ""
-          
-          echo "📝 Note about Node.js 20 warning:"
-          echo "  This is just a warning, not an error."
-          echo "  Actions will continue to work until June 2026."
-          echo "  See: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/"
