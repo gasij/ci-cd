@@ -6,10 +6,6 @@ on:
     types: [closed]
   workflow_dispatch:
     inputs:
-      test_node24:
-        description: 'Тестировать с Node.js 24'
-        type: boolean
-        default: false
       debug_mode:
         description: 'Режим отладки'
         type: boolean
@@ -46,6 +42,7 @@ jobs:
             CURRENT_VERSION="0.1.0"
           fi
           echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "📌 Current version: $CURRENT_VERSION"
 
       - name: Determine version bump type
         id: get_type
@@ -55,12 +52,15 @@ jobs:
           if echo "$COMMITS" | grep -qiE "^(feat|feature):"; then
             echo "type=minor" >> $GITHUB_OUTPUT
             echo "version_type=minor" >> $GITHUB_OUTPUT
+            echo "📊 Detected: minor version bump"
           elif echo "$COMMITS" | grep -qiE "^(fix|hotfix):"; then
             echo "type=patch" >> $GITHUB_OUTPUT
             echo "version_type=patch" >> $GITHUB_OUTPUT
+            echo "📊 Detected: patch version bump"
           else
             echo "type=patch" >> $GITHUB_OUTPUT
             echo "version_type=patch" >> $GITHUB_OUTPUT
+            echo "📊 Detected: default patch version bump"
           fi
 
       - name: Bump version
@@ -89,13 +89,16 @@ jobs:
           NEW_VERSION="$MAJOR.$MINOR.$PATCH"
           echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
           echo "old_version=$CURRENT" >> $GITHUB_OUTPUT
+          echo "version_type=$TYPE" >> $GITHUB_OUTPUT
+          echo "📦 Version updated: $CURRENT → $NEW_VERSION"
 
       - name: Update VERSION file
         run: |
           echo "${{ steps.bump.outputs.new_version }}" > VERSION
+          echo "📝 VERSION file updated to: $(cat VERSION)"
 
-      # ИСПРАВЛЕНО: Безопасный пуш с pull --rebase
-      - name: Commit and push new version safely
+      # ПОЛНОСТЬЮ ИСПРАВЛЕНО: Надёжный пуш с retry и pull
+      - name: Push changes safely
         run: |
           git config --global user.name 'GitHub Actions'
           git config --global user.email 'actions@github.com'
@@ -104,55 +107,87 @@ jobs:
           
           # Проверяем, есть ли изменения
           if git diff --staged --quiet; then
-            echo "No changes to commit"
+            echo "ℹ️ No changes to commit"
             exit 0
           fi
           
           # Создаем коммит
-          git commit -m "[${{ steps.bump.outputs.new_version }}] <- [${{ steps.bump.outputs.old_version }}] up"
+          git commit -m "chore(version): bump to ${{ steps.bump.outputs.new_version }}"
           
-          # Сохраняем текущий коммит во временную переменную
-          LOCAL_COMMIT=$(git rev-parse HEAD)
-          echo "Local commit: $LOCAL_COMMIT"
+          # Сохраняем хеш коммита
+          COMMIT_HASH=$(git rev-parse HEAD)
+          echo "✅ Local commit created: $COMMIT_HASH"
           
-          # Пытаемся запушить с retry логикой
-          MAX_RETRIES=3
+          # Максимальное количество попыток
+          MAX_RETRIES=5
           RETRY=0
+          PUSH_SUCCESS=false
           
-          while [ $RETRY -lt $MAX_RETRIES ]; do
-            echo "Push attempt $((RETRY+1))/$MAX_RETRIES"
+          while [ $RETRY -lt $MAX_RETRIES ] && [ "$PUSH_SUCCESS" = false ]; do
+            echo "🔄 Push attempt $((RETRY+1))/$MAX_RETRIES..."
             
             # Пытаемся запушить
-            if git push; then
+            if git push origin main; then
               echo "✅ Push successful!"
-              exit 0
+              PUSH_SUCCESS=true
+              break
             else
-              echo "⚠️ Push failed, checking for remote changes..."
+              echo "⚠️ Push failed, attempt $((RETRY+1))"
+              
+              # Проверяем, не изменился ли удаленный репозиторий
+              echo "📡 Fetching remote changes..."
+              git fetch origin main
+              
+              # Проверяем, есть ли новые коммиты
+              REMOTE_COMMITS=$(git rev-list HEAD..origin/main --count)
+              if [ "$REMOTE_COMMITS" -gt 0 ]; then
+                echo "📥 Found $REMOTE_COMMITS new remote commit(s), pulling with rebase..."
+                
+                # Пытаемся сделать rebase
+                if git pull --rebase origin main; then
+                  echo "✅ Rebase successful"
+                  
+                  # Проверяем, не потеряли ли мы наш коммит
+                  if ! git cat-file -e $COMMIT_HASH 2>/dev/null; then
+                    echo "⚠️ Original commit was lost, but changes should be preserved"
+                    # Получаем новый хеш последнего коммита
+                    COMMIT_HASH=$(git rev-parse HEAD)
+                  fi
+                else
+                  echo "❌ Rebase failed, aborting..."
+                  git rebase --abort
+                  
+                  # Если rebase не удался, пробуем простой pull и merge
+                  echo "🔄 Trying merge instead..."
+                  git pull origin main --no-rebase
+                  
+                  # Восстанавливаем наш коммит, если он потерян
+                  if ! git cat-file -e $COMMIT_HASH 2>/dev/null; then
+                    echo "⚠️ Re-creating our commit..."
+                    echo "${{ steps.bump.outputs.new_version }}" > VERSION
+                    git add VERSION
+                    git commit -m "chore(version): bump to ${{ steps.bump.outputs.new_version }}"
+                    COMMIT_HASH=$(git rev-parse HEAD)
+                  fi
+                fi
+              fi
+              
               RETRY=$((RETRY+1))
               
               if [ $RETRY -lt $MAX_RETRIES ]; then
-                echo "Pulling latest changes with rebase..."
-                git pull --rebase origin main
-                
-                # Проверяем, не потеряли ли мы наш коммит
-                if ! git cat-file -e $LOCAL_COMMIT 2>/dev/null; then
-                  echo "⚠️ Local commit was lost during rebase, recreating..."
-                  # Наш коммит был потерян при rebase, нужно создать его заново
-                  echo "${{ steps.bump.outputs.new_version }}" > VERSION
-                  git add VERSION
-                  git commit -m "[${{ steps.bump.outputs.new_version }}] <- [${{ steps.bump.outputs.old_version }}] up"
-                  LOCAL_COMMIT=$(git rev-parse HEAD)
-                fi
+                echo "⏳ Waiting 5 seconds before retry..."
+                sleep 5
               fi
             fi
           done
           
-          echo "❌ Failed to push after $MAX_RETRIES attempts"
-          exit 1
+          if [ "$PUSH_SUCCESS" = false ]; then
+            echo "❌ Failed to push after $MAX_RETRIES attempts"
+            exit 1
+          fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # Альтернативный вариант: использовать actions/github-script для пуша
   add-version-label:
     name: "Добавить label с версией"
     needs: bump-version
@@ -167,11 +202,12 @@ jobs:
             const newVersion = '${{ needs.bump-version.outputs.new_version }}';
             
             if (!newVersion) {
-              console.log('No version provided, skipping');
+              console.log('❌ No version provided, skipping');
               return;
             }
             
             const labelName = `v${newVersion}`;
+            console.log(`🏷️ Adding label: ${labelName}`);
             
             try {
               // Проверяем существование метки
@@ -183,8 +219,9 @@ jobs:
                   name: labelName
                 });
                 labelExists = true;
+                console.log(`✅ Label ${labelName} already exists`);
               } catch (e) {
-                // Метка не существует
+                console.log(`📝 Label ${labelName} does not exist, creating...`);
               }
               
               // Создаем метку, если её нет
@@ -196,6 +233,7 @@ jobs:
                   color: '0e8a16',
                   description: `Version ${newVersion}`
                 });
+                console.log(`✅ Created label ${labelName}`);
               }
               
               // Добавляем метку к PR
@@ -206,7 +244,21 @@ jobs:
                 labels: [labelName]
               });
               
-              console.log(`✅ Added label ${labelName}`);
+              console.log(`✅ Successfully added label ${labelName}`);
             } catch (error) {
               console.log(`⚠️ Label error: ${error.message}`);
             }
+
+  # Добавляем уведомление об успехе
+  notify-success:
+    name: "Уведомление об успехе"
+    needs: [bump-version, add-version-label]
+    runs-on: ubuntu-latest
+    if: success()
+    steps:
+      - name: Success message
+        run: |
+          echo "🎉 Version update completed successfully!"
+          echo "📦 New version: ${{ needs.bump-version.outputs.new_version }}"
+          echo "📅 Node.js 20 deprecation: June 2nd, 2026"
+          echo "🔗 More info: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/"
