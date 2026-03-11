@@ -4,6 +4,12 @@ on:
   pull_request:
     branches: [main, master]
     types: [closed]
+  workflow_dispatch:
+    inputs:
+      test_node24:
+        description: 'Тестировать с Node.js 24'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -21,7 +27,6 @@ jobs:
       version_type: ${{ steps.bump.outputs.version_type }}
     
     steps:
-      # Обновлено: проверьте наличие новой версии actions/checkout
       - name: Checkout code
         uses: actions/checkout@v4
         with:
@@ -41,13 +46,18 @@ jobs:
       - name: Determine version bump type
         id: get_type
         run: |
-          COMMITS=$(git log ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }} --pretty=format:"%s")
+          # Исправлено: добавляем проверку на наличие коммитов
+          COMMITS=$(git log ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }} --pretty=format:"%s" 2>/dev/null || echo "")
+          
           if echo "$COMMITS" | grep -qiE "^(feat|feature):"; then
             echo "type=minor" >> $GITHUB_OUTPUT
+            echo "version_type=minor" >> $GITHUB_OUTPUT
           elif echo "$COMMITS" | grep -qiE "^(fix|hotfix):"; then
             echo "type=patch" >> $GITHUB_OUTPUT
+            echo "version_type=patch" >> $GITHUB_OUTPUT
           else
             echo "type=patch" >> $GITHUB_OUTPUT
+            echo "version_type=patch" >> $GITHUB_OUTPUT
           fi
 
       - name: Bump version
@@ -55,15 +65,26 @@ jobs:
         run: |
           CURRENT="${{ steps.get_current.outputs.current_version }}"
           TYPE="${{ steps.get_type.outputs.type }}"
+          
+          # Исправлено: обработка случая, если CURRENT пустой
+          if [ -z "$CURRENT" ]; then
+            CURRENT="0.1.0"
+          fi
+          
           IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          
+          # Исправлено: проверка что MAJOR, MINOR, PATCH - числа
+          MAJOR=${MAJOR:-0}
+          MINOR=${MINOR:-1}
+          PATCH=${PATCH:-0}
+          
           if [ "$TYPE" = "minor" ]; then
             MINOR=$((MINOR + 1))
             PATCH=0
-            echo "version_type=minor" >> $GITHUB_OUTPUT
           else
             PATCH=$((PATCH + 1))
-            echo "version_type=patch" >> $GITHUB_OUTPUT
           fi
+          
           NEW_VERSION="$MAJOR.$MINOR.$PATCH"
           echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
           echo "old_version=$CURRENT" >> $GITHUB_OUTPUT
@@ -77,8 +98,14 @@ jobs:
           git config --global user.name 'GitHub Actions'
           git config --global user.email 'actions@github.com'
           git add VERSION
-          git commit -m "[${{ steps.bump.outputs.new_version }}] <- [${{ steps.bump.outputs.old_version }}] ${{ steps.bump.outputs.version_type }} up" || echo "No changes"
-          git push
+          
+          # Исправлено: проверяем, есть ли изменения для коммита
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "[${{ steps.bump.outputs.new_version }}] <- [${{ steps.bump.outputs.old_version }}] ${{ steps.bump.outputs.version_type }} up"
+            git push
+          fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -86,28 +113,42 @@ jobs:
     name: "Добавить label с версией"
     needs: bump-version
     runs-on: ubuntu-latest
-    if: github.event.pull_request.merged == true
+    # Исправлено: добавляем проверку наличия new_version
+    if: github.event.pull_request.merged == true && needs.bump-version.outputs.new_version != ''
     steps:
-      # Обновлено: actions/github-script@v7 уже должен поддерживать Node.js 24
       - name: Add version label using GitHub Script
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const newVersion = '${{ needs.bump-version.outputs.new_version }}';
+            
+            if (!newVersion) {
+              console.log('❌ No version provided, skipping label creation');
+              return;
+            }
+            
             const labelName = `v${newVersion}`;
             
             console.log(`Attempting to add label: ${labelName} to PR #${context.issue.number}`);
             
             try {
-              // Сначала проверяем, существует ли метка
-              await github.rest.issues.getLabel({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                name: labelName
-              }).catch(async () => {
-                // Если метка не существует, создаём её
-                console.log(`Label ${labelName} does not exist, creating...`);
+              // Проверяем существование метки
+              let labelExists = false;
+              try {
+                await github.rest.issues.getLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: labelName
+                });
+                labelExists = true;
+                console.log(`Label ${labelName} already exists`);
+              } catch (e) {
+                console.log(`Label ${labelName} does not exist, will create it`);
+              }
+              
+              // Создаем метку, если её нет
+              if (!labelExists) {
                 await github.rest.issues.createLabel({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
@@ -115,9 +156,10 @@ jobs:
                   color: '0e8a16',
                   description: `Version ${newVersion}`
                 });
-              });
+                console.log(`✅ Created label ${labelName}`);
+              }
               
-              // Добавляем метку к PR (даже если он закрыт)
+              // Добавляем метку к PR
               await github.rest.issues.addLabels({
                 issue_number: context.issue.number,
                 owner: context.repo.owner,
@@ -128,23 +170,26 @@ jobs:
               console.log(`✅ Successfully added label ${labelName}`);
             } catch (error) {
               console.log(`❌ Error: ${error.message}`);
-              // Не проваливаем задание, если метку не удалось добавить
-              // (например, если PR уже закрыт - API может вернуть ошибку)
+              // Не проваливаем задание, так как label - это не критично
             }
 
-  # Опционально: проверка совместимости с Node.js 24
-  test-node24-compatibility:
-    name: "Проверка совместимости с Node.js 24"
+  # Добавляем диагностическую задачу для отладки
+  debug-info:
+    name: "Диагностика"
     runs-on: ubuntu-latest
-    needs: bump-version
-    if: false # Включите для тестирования (замените на true)
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    if: failure() # Запускается только при ошибке
+    needs: [bump-version]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            console.log('✅ Тестирование с Node.js 24 прошло успешно');
-            console.log('Текущая версия:', '${{ needs.bump-version.outputs.new_version }}');
+      - name: Check debug info
+        run: |
+          echo "🔍 Диагностическая информация:"
+          echo "PR merged: ${{ github.event.pull_request.merged }}"
+          echo "New version: ${{ needs.bump-version.outputs.new_version }}"
+          echo "Old version: ${{ needs.bump-version.outputs.old_version }}"
+          echo "Version type: ${{ needs.bump-version.outputs.version_type }}"
+          
+          # Проверяем наличие Node.js
+          node --version
+          
+          echo "📅 Предупреждение о Node.js 20 - это нормально до июня 2026"
+          echo "Ссылка: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/"
