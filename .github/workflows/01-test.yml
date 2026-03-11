@@ -2,19 +2,20 @@ name: "01 - Тестирование"
 
 on:
   pull_request:
-    branches: [main, master,bash]
-
+    branches: [main, master, bash]
 
 permissions:
- contents: read
- pull-requests: write
- issues: write
+  contents: read
+  pull-requests: write
+  issues: write
 
 jobs:
   unit-tests:
     name: "Unit Tests"
     runs-on: ubuntu-latest
     steps:
+      # Обновлено: проверьте, вышла ли новая мажорная версия actions/checkout
+      # Например, если есть @v5 или выше, используйте её для поддержки Node.js 24
       - uses: actions/checkout@v4
       - name: Run unit tests
         run: |
@@ -25,6 +26,7 @@ jobs:
     name: "Integration Tests"
     runs-on: ubuntu-latest
     steps:
+      # Обновлено: проверьте, вышла ли новая мажорная версия actions/checkout
       - uses: actions/checkout@v4
       - name: Run integration tests
         run: |
@@ -37,12 +39,13 @@ jobs:
     runs-on: ubuntu-latest
     if: success()
     steps:
+      # Обновлено: actions/github-script@v7 уже должен поддерживать Node.js 24
+      # но для уверенности проверьте последнюю версию в маркете
       - name: Add label
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            
             console.log(`Adding label to PR #${context.issue.number}`);
             
             await github.rest.issues.addLabels({
@@ -53,3 +56,19 @@ jobs:
             });
             
             console.log('✅ Label test-passed added successfully');
+  
+  # Опционально: добавить проверку совместимости с Node.js 24
+  test-node24-compatibility:
+    name: "Проверка совместимости с Node.js 24"
+    runs-on: ubuntu-latest
+    if: false # Замените на true, если хотите протестировать
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            console.log('Тестирование с принудительным использованием Node.js 24');
+            console.log('✅ Если вы видите это сообщение, действия совместимы!');

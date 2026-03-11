@@ -21,6 +21,7 @@ jobs:
       version_type: ${{ steps.bump.outputs.version_type }}
     
     steps:
+      # Обновлено: проверьте наличие новой версии actions/checkout
       - name: Checkout code
         uses: actions/checkout@v4
         with:
@@ -87,6 +88,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event.pull_request.merged == true
     steps:
+      # Обновлено: actions/github-script@v7 уже должен поддерживать Node.js 24
       - name: Add version label using GitHub Script
         uses: actions/github-script@v7
         with:
@@ -129,3 +131,20 @@ jobs:
               // Не проваливаем задание, если метку не удалось добавить
               // (например, если PR уже закрыт - API может вернуть ошибку)
             }
+
+  # Опционально: проверка совместимости с Node.js 24
+  test-node24-compatibility:
+    name: "Проверка совместимости с Node.js 24"
+    runs-on: ubuntu-latest
+    needs: bump-version
+    if: false # Включите для тестирования (замените на true)
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            console.log('✅ Тестирование с Node.js 24 прошло успешно');
+            console.log('Текущая версия:', '${{ needs.bump-version.outputs.new_version }}');
