@@ -10,6 +10,10 @@ on:
         description: 'Тестировать с Node.js 24'
         type: boolean
         default: false
+      debug_mode:
+        description: 'Режим отладки'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -46,7 +50,6 @@ jobs:
       - name: Determine version bump type
         id: get_type
         run: |
-          # Исправлено: добавляем проверку на наличие коммитов
           COMMITS=$(git log ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }} --pretty=format:"%s" 2>/dev/null || echo "")
           
           if echo "$COMMITS" | grep -qiE "^(feat|feature):"; then
@@ -66,14 +69,12 @@ jobs:
           CURRENT="${{ steps.get_current.outputs.current_version }}"
           TYPE="${{ steps.get_type.outputs.type }}"
           
-          # Исправлено: обработка случая, если CURRENT пустой
           if [ -z "$CURRENT" ]; then
             CURRENT="0.1.0"
           fi
           
           IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
           
-          # Исправлено: проверка что MAJOR, MINOR, PATCH - числа
           MAJOR=${MAJOR:-0}
           MINOR=${MINOR:-1}
           PATCH=${PATCH:-0}
@@ -93,30 +94,72 @@ jobs:
         run: |
           echo "${{ steps.bump.outputs.new_version }}" > VERSION
 
-      - name: Commit new version
+      # ИСПРАВЛЕНО: Безопасный пуш с pull --rebase
+      - name: Commit and push new version safely
         run: |
           git config --global user.name 'GitHub Actions'
           git config --global user.email 'actions@github.com'
+          
           git add VERSION
           
-          # Исправлено: проверяем, есть ли изменения для коммита
+          # Проверяем, есть ли изменения
           if git diff --staged --quiet; then
             echo "No changes to commit"
-          else
-            git commit -m "[${{ steps.bump.outputs.new_version }}] <- [${{ steps.bump.outputs.old_version }}] ${{ steps.bump.outputs.version_type }} up"
-            git push
+            exit 0
           fi
+          
+          # Создаем коммит
+          git commit -m "[${{ steps.bump.outputs.new_version }}] <- [${{ steps.bump.outputs.old_version }}] up"
+          
+          # Сохраняем текущий коммит во временную переменную
+          LOCAL_COMMIT=$(git rev-parse HEAD)
+          echo "Local commit: $LOCAL_COMMIT"
+          
+          # Пытаемся запушить с retry логикой
+          MAX_RETRIES=3
+          RETRY=0
+          
+          while [ $RETRY -lt $MAX_RETRIES ]; do
+            echo "Push attempt $((RETRY+1))/$MAX_RETRIES"
+            
+            # Пытаемся запушить
+            if git push; then
+              echo "✅ Push successful!"
+              exit 0
+            else
+              echo "⚠️ Push failed, checking for remote changes..."
+              RETRY=$((RETRY+1))
+              
+              if [ $RETRY -lt $MAX_RETRIES ]; then
+                echo "Pulling latest changes with rebase..."
+                git pull --rebase origin main
+                
+                # Проверяем, не потеряли ли мы наш коммит
+                if ! git cat-file -e $LOCAL_COMMIT 2>/dev/null; then
+                  echo "⚠️ Local commit was lost during rebase, recreating..."
+                  # Наш коммит был потерян при rebase, нужно создать его заново
+                  echo "${{ steps.bump.outputs.new_version }}" > VERSION
+                  git add VERSION
+                  git commit -m "[${{ steps.bump.outputs.new_version }}] <- [${{ steps.bump.outputs.old_version }}] up"
+                  LOCAL_COMMIT=$(git rev-parse HEAD)
+                fi
+              fi
+            fi
+          done
+          
+          echo "❌ Failed to push after $MAX_RETRIES attempts"
+          exit 1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  # Альтернативный вариант: использовать actions/github-script для пуша
   add-version-label:
     name: "Добавить label с версией"
     needs: bump-version
     runs-on: ubuntu-latest
-    # Исправлено: добавляем проверку наличия new_version
     if: github.event.pull_request.merged == true && needs.bump-version.outputs.new_version != ''
     steps:
-      - name: Add version label using GitHub Script
+      - name: Add version label
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -124,13 +167,11 @@ jobs:
             const newVersion = '${{ needs.bump-version.outputs.new_version }}';
             
             if (!newVersion) {
-              console.log('❌ No version provided, skipping label creation');
+              console.log('No version provided, skipping');
               return;
             }
             
             const labelName = `v${newVersion}`;
-            
-            console.log(`Attempting to add label: ${labelName} to PR #${context.issue.number}`);
             
             try {
               // Проверяем существование метки
@@ -142,9 +183,8 @@ jobs:
                   name: labelName
                 });
                 labelExists = true;
-                console.log(`Label ${labelName} already exists`);
               } catch (e) {
-                console.log(`Label ${labelName} does not exist, will create it`);
+                // Метка не существует
               }
               
               // Создаем метку, если её нет
@@ -156,7 +196,6 @@ jobs:
                   color: '0e8a16',
                   description: `Version ${newVersion}`
                 });
-                console.log(`✅ Created label ${labelName}`);
               }
               
               // Добавляем метку к PR
@@ -167,29 +206,7 @@ jobs:
                 labels: [labelName]
               });
               
-              console.log(`✅ Successfully added label ${labelName}`);
+              console.log(`✅ Added label ${labelName}`);
             } catch (error) {
-              console.log(`❌ Error: ${error.message}`);
-              // Не проваливаем задание, так как label - это не критично
+              console.log(`⚠️ Label error: ${error.message}`);
             }
-
-  # Добавляем диагностическую задачу для отладки
-  debug-info:
-    name: "Диагностика"
-    runs-on: ubuntu-latest
-    if: failure() # Запускается только при ошибке
-    needs: [bump-version]
-    steps:
-      - name: Check debug info
-        run: |
-          echo "🔍 Диагностическая информация:"
-          echo "PR merged: ${{ github.event.pull_request.merged }}"
-          echo "New version: ${{ needs.bump-version.outputs.new_version }}"
-          echo "Old version: ${{ needs.bump-version.outputs.old_version }}"
-          echo "Version type: ${{ needs.bump-version.outputs.version_type }}"
-          
-          # Проверяем наличие Node.js
-          node --version
-          
-          echo "📅 Предупреждение о Node.js 20 - это нормально до июня 2026"
-          echo "Ссылка: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/"
